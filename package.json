@@ -7,7 +7,7 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "db:init": "node src/db/initDb.js",
-    "test": "node test/spa_routing.test.js && node test/checkout_security.test.js && node test/admin_backend.test.js && node test/product_deletion_fk.test.js",
+    "test": "node test/spa_routing.test.js && node test/checkout_security.test.js && node test/razorpay_audit_security.test.js && node test/admin_backend.test.js && node test/product_deletion_fk.test.js && node test/product_multi_images.test.js",
     "test:spa": "node test/spa_routing.test.js"
   },
   "dependencies": {

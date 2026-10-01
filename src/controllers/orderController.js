@@ -173,14 +173,20 @@ exports.createOrder = async (req, res, next) => {
         payableAmount = advanceAmount;
       }
 
+      if (isNaN(payableAmount) || payableAmount < 1.0) {
+        const err = new Error('Order payable amount must be at least ₹1.00');
+        err.statusCode = 400;
+        throw err;
+      }
+
       // Create Razorpay Order via official service for the exact payable amount
       const rzpOrder = await razorpayService.createRazorpayOrder({
         amount: payableAmount,
         receipt: orderNumber,
         notes: {
           orderNumber,
-          customerId,
-        customerMobile: cleanPrimaryMobile,
+          customerId: String(customerId),
+          customerMobile: cleanPrimaryMobile,
           payment_mode: paymentMode,
           total_amount: String(totalAmount),
           advance_amount: String(advanceAmount),
@@ -190,14 +196,14 @@ exports.createOrder = async (req, res, next) => {
 
       // Store checkout draft in order_drafts table (No confirmed order created until payment verification!)
       const deliveryDetails = {
-        full_name: full_name.trim(),
+        full_name: full_name.trim().slice(0, 120),
         primary_mobile: cleanPrimaryMobile,
         secondary_mobile: cleanSecondaryMobile && cleanSecondaryMobile.length === 10 ? cleanSecondaryMobile : null,
         address: address.trim(),
-        state: state.trim(),
-        district: district.trim(),
-        city: city ? city.trim() : null,
-        village: village ? village.trim() : null,
+        state: state.trim().slice(0, 80),
+        district: district.trim().slice(0, 80),
+        city: city ? city.trim().slice(0, 80) : null,
+        village: village ? village.trim().slice(0, 80) : null,
         pincode: cleanPincode,
         validLat,
         validLng,
@@ -246,10 +252,16 @@ exports.createOrder = async (req, res, next) => {
       order: orderResult
     });
   } catch (error) {
-    if (error.status) {
-      return res.status(error.status).json({ success: false, message: error.message });
+    if (error.statusCode || error.status) {
+      return res.status(error.statusCode || error.status).json({ success: false, message: error.message });
     }
-    if (error.message && (error.message.includes('out of stock') || error.message.includes('unavailable') || error.message.includes('not found'))) {
+    if (error.message && (
+      error.message.includes('out of stock') ||
+      error.message.includes('unavailable') ||
+      error.message.includes('not found') ||
+      error.message.includes('at least ₹1.00') ||
+      error.message.includes('quantity')
+    )) {
       return res.status(400).json({ success: false, message: error.message });
     }
     next(error);

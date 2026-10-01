@@ -30,27 +30,38 @@ exports.verifyPayment = async (req, res, next) => {
       razorpay_signature
     } = req.body;
 
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+    if (
+      !razorpay_order_id ||
+      !razorpay_payment_id ||
+      !razorpay_signature ||
+      typeof razorpay_order_id !== 'string' ||
+      typeof razorpay_payment_id !== 'string' ||
+      typeof razorpay_signature !== 'string'
+    ) {
       return res.status(400).json({
         success: false,
-        message: 'Missing required Razorpay payment verification fields.'
+        message: 'Missing or invalid required Razorpay payment verification fields.'
       });
     }
 
-    // Cryptographic HMAC-SHA256 signature check (Server-side verification)
+    const cleanOrderId = razorpay_order_id.trim();
+    const cleanPaymentId = razorpay_payment_id.trim();
+    const cleanSignature = razorpay_signature.trim();
+
+    // 1. Cryptographic HMAC-SHA256 signature check (Server-side verification)
     const isValid = razorpayService.verifyPaymentSignature({
-      razorpay_order_id,
-      razorpay_payment_id,
-      razorpay_signature
+      razorpay_order_id: cleanOrderId,
+      razorpay_payment_id: cleanPaymentId,
+      razorpay_signature: cleanSignature
     });
 
     if (!isValid) {
-      // Mark draft as FAILED
+      // Mark draft as FAILED for security audit
       await db.query(
         `UPDATE order_drafts
          SET status = 'FAILED'
          WHERE razorpay_order_id = ? AND user_id = ? AND status = 'INITIATED'`,
-        [razorpay_order_id, customerId]
+        [cleanOrderId, customerId]
       );
 
       return res.status(400).json({
@@ -59,24 +70,99 @@ exports.verifyPayment = async (req, res, next) => {
       });
     }
 
-    // Fetch additional payment metadata from Razorpay API
+    // 2. Fetch live payment details from Razorpay API for deep verification
     let paymentMethod = 'RAZORPAY';
+    let rzpPayment = null;
     try {
-      const rzpPayment = await razorpayService.fetchPaymentDetails(razorpay_payment_id);
-      if (rzpPayment && rzpPayment.method) {
-        paymentMethod = rzpPayment.method.toUpperCase();
+      rzpPayment = await razorpayService.fetchPaymentDetails(cleanPaymentId);
+      if (rzpPayment) {
+        if (rzpPayment.method) {
+          paymentMethod = String(rzpPayment.method).toUpperCase();
+        }
+
+        // Validate payment status if returned by Razorpay API
+        if (rzpPayment.status) {
+          const statusLower = String(rzpPayment.status).toLowerCase();
+          if (!['captured', 'authorized'].includes(statusLower)) {
+            await db.query(
+              `UPDATE order_drafts
+               SET status = 'FAILED'
+               WHERE razorpay_order_id = ? AND user_id = ? AND status = 'INITIATED'`,
+              [cleanOrderId, customerId]
+            );
+
+            return res.status(400).json({
+              success: false,
+              message: `Payment verification failed: Razorpay payment status is "${rzpPayment.status}".`
+            });
+          }
+        }
+
+        // Validate order_id binding
+        if (rzpPayment.order_id && rzpPayment.order_id !== cleanOrderId) {
+          return res.status(400).json({
+            success: false,
+            message: 'Payment verification failed: Razorpay payment is not associated with this order.'
+          });
+        }
+
+        // Validate currency
+        if (rzpPayment.currency && String(rzpPayment.currency).toUpperCase() !== 'INR') {
+          return res.status(400).json({
+            success: false,
+            message: 'Payment verification failed: Unsupported currency.'
+          });
+        }
       }
     } catch (e) {
-      console.log('Notice: Could not fetch payment method detail from Razorpay:', e.message);
+      console.log('Notice: Live payment fetch skipped or errored:', e.message);
     }
 
-    // Create confirmed order atomically in MySQL transaction
+    // 3. Create confirmed order atomically in MySQL transaction
+    // Enforce consistent locking order: order_drafts first, then orders
     const verifyResult = await db.withTransaction(async (conn) => {
-      // 1. Idempotency check: Has this order already been confirmed?
+      // Step A: Lock and load draft from order_drafts
+      const [draftRows] = await conn.execute(
+        `SELECT * FROM order_drafts WHERE razorpay_order_id = ? FOR UPDATE`,
+        [cleanOrderId]
+      );
+
+      if (draftRows.length === 0) {
+        const error = new Error('Checkout session corresponding to this payment was not found or has expired.');
+        error.statusCode = 404;
+        throw error;
+      }
+
+      const draft = draftRows[0];
+      if (draft.user_id !== customerId) {
+        const error = new Error('This checkout session does not belong to your account.');
+        error.statusCode = 403;
+        throw error;
+      }
+
+      // Check draft session age (max 24 hours)
+      const draftAgeMs = Date.now() - new Date(draft.created_at).getTime();
+      if (draftAgeMs > 24 * 60 * 60 * 1000) {
+        const error = new Error('Checkout session has expired. Please initiate a new order.');
+        error.statusCode = 400;
+        throw error;
+      }
+
+      // Validate live fetched amount against server-calculated draft amount
+      if (rzpPayment && rzpPayment.amount) {
+        const expectedPaise = Math.round(Number(draft.payable_amount) * 100);
+        if (Number(rzpPayment.amount) !== expectedPaise) {
+          const error = new Error(`Payment amount mismatch. Expected: ₹${draft.payable_amount}, received: ₹${Number(rzpPayment.amount) / 100}.`);
+          error.statusCode = 400;
+          throw error;
+        }
+      }
+
+      // Step B: Lock orders to check if order already confirmed (idempotency check)
       const [existingOrders] = await conn.execute(
         `SELECT id, order_number, payment_status, user_id
          FROM orders WHERE razorpay_order_id = ? FOR UPDATE`,
-        [razorpay_order_id]
+        [cleanOrderId]
       );
 
       if (existingOrders.length > 0) {
@@ -93,26 +179,32 @@ exports.verifyPayment = async (req, res, next) => {
         };
       }
 
-      // 2. Load draft from order_drafts
-      const [draftRows] = await conn.execute(
-        `SELECT * FROM order_drafts WHERE razorpay_order_id = ? FOR UPDATE`,
-        [razorpay_order_id]
-      );
-
-      if (draftRows.length === 0) {
-        throw new Error('Checkout session corresponding to this payment was not found or has expired.');
+      // If draft is already marked COMPLETED (e.g. concurrent webhook confirmed it),
+      // look up existing order by order_number
+      if (draft.status === 'COMPLETED') {
+        const [ordersByNumber] = await conn.execute(
+          `SELECT id, order_number, user_id FROM orders WHERE order_number = ? FOR UPDATE`,
+          [draft.order_number]
+        );
+        if (ordersByNumber.length > 0) {
+          const existing = ordersByNumber[0];
+          if (existing.user_id !== customerId) {
+            const error = new Error('This payment does not belong to your account.');
+            error.statusCode = 403;
+            throw error;
+          }
+          return {
+            alreadyVerified: true,
+            orderNumber: existing.order_number,
+            orderId: existing.id
+          };
+        }
       }
 
-      const draft = draftRows[0];
-      if (draft.user_id !== customerId) {
-        const error = new Error('This checkout session does not belong to your account.');
-        error.statusCode = 403;
-        throw error;
-      }
       const delivery = typeof draft.delivery_details === 'string' ? JSON.parse(draft.delivery_details) : draft.delivery_details;
       const items = typeof draft.items_data === 'string' ? JSON.parse(draft.items_data) : draft.items_data;
 
-      // 3. Insert confirmed Order record with PAID payment status ONLY NOW
+      // Step C: Insert confirmed Order record with PAID payment status ONLY NOW
       const [orderInsert] = await conn.execute(
         `INSERT INTO orders (
           order_number, user_id, full_name, primary_mobile, secondary_mobile,
@@ -142,13 +234,13 @@ exports.verifyPayment = async (req, res, next) => {
           draft.payment_mode,
           draft.advance_amount,
           draft.remaining_cod_amount,
-          razorpay_order_id
+          cleanOrderId
         ]
       );
 
       const newOrderId = orderInsert.insertId;
 
-      // 4. Insert Order Items
+      // Step D: Insert Order Items
       for (const it of items) {
         await conn.execute(
           `INSERT INTO order_items (
@@ -168,7 +260,7 @@ exports.verifyPayment = async (req, res, next) => {
         );
       }
 
-      // 5. Insert Payment Record
+      // Step E: Insert Payment Record
       await conn.execute(
         `INSERT INTO payments (
           order_id, user_id, amount, payment_mode, payment_type, remaining_cod_amount,
@@ -183,20 +275,20 @@ exports.verifyPayment = async (req, res, next) => {
           draft.payment_mode === 'COD' ? 'COD_ADVANCE' : 'FULL',
           draft.remaining_cod_amount,
           paymentMethod,
-          razorpay_payment_id,
-          razorpay_order_id,
-          razorpay_payment_id,
-          razorpay_signature
+          cleanPaymentId,
+          cleanOrderId,
+          cleanPaymentId,
+          cleanSignature
         ]
       );
 
-      // 6. Mark draft as COMPLETED
+      // Step F: Mark draft as COMPLETED
       await conn.execute(
         `UPDATE order_drafts SET status = 'COMPLETED' WHERE id = ?`,
         [draft.id]
       );
 
-      // 7. Update customer saved delivery details
+      // Step G: Update customer saved delivery details
       await conn.execute(
         `UPDATE customers
          SET full_name = ?,
@@ -233,9 +325,12 @@ exports.verifyPayment = async (req, res, next) => {
       message: 'Payment verified successfully and order placed!',
       orderNumber: verifyResult.orderNumber,
       orderId: verifyResult.orderId,
-      paymentId: razorpay_payment_id
+      paymentId: cleanPaymentId
     });
   } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ success: false, message: error.message });
+    }
     next(error);
   }
 };
@@ -253,15 +348,16 @@ exports.handlePaymentFailed = async (req, res, next) => {
     } = req.body;
 
     const reason = error_description || error_code || 'Payment cancelled or dismissed by customer';
-    const isCancel = reason.toLowerCase().includes('cancel') || reason.toLowerCase().includes('dismiss');
+    const isCancel = String(reason).toLowerCase().includes('cancel') || String(reason).toLowerCase().includes('dismiss');
     const newStatus = isCancel ? 'CANCELLED' : 'FAILED';
 
-    if (razorpay_order_id) {
+    if (razorpay_order_id && typeof razorpay_order_id === 'string') {
+      const cleanOrderId = razorpay_order_id.trim();
       await db.query(
         `UPDATE order_drafts
          SET status = ?
          WHERE razorpay_order_id = ? AND user_id = ? AND status = 'INITIATED'`,
-        [newStatus, razorpay_order_id, customerId]
+        [newStatus, cleanOrderId, customerId]
       );
     }
 
@@ -286,15 +382,20 @@ exports.handlePaymentFailed = async (req, res, next) => {
  */
 exports.handleWebhook = async (req, res, next) => {
   try {
-    const signature = req.headers['x-razorpay-signature'];
+    const signature = req.headers['x-razorpay-signature'] || (typeof req.get === 'function' ? req.get('x-razorpay-signature') : null);
     const rawBody = req.rawBody;
+
+    if (!signature || !rawBody) {
+      console.warn('⚠️ [Razorpay Webhook]: Missing signature or raw body.');
+      return res.status(400).json({ success: false, message: 'Missing signature or payload.' });
+    }
 
     // Cryptographically verify webhook signature
     const isValid = razorpayService.verifyWebhookSignature(rawBody, signature);
 
     if (!isValid) {
       console.warn('⚠️ [Razorpay Webhook]: Signature mismatch or unauthenticated webhook request.');
-      return res.status(400).json({ success: false, message: 'Invalid webhook signature' });
+      return res.status(400).json({ success: false, message: 'Invalid webhook signature.' });
     }
 
     const event = req.body.event;
@@ -332,21 +433,37 @@ exports.handleWebhook = async (req, res, next) => {
 
     // Process event within database transaction
     await db.withTransaction(async (conn) => {
-      // Record event ID to guarantee idempotency
+      // Record event ID to guarantee idempotency (safely ignore concurrent duplicate inserts)
       if (eventId) {
-        await conn.execute(
-          'INSERT INTO webhook_events (event_id, event_type, payload) VALUES (?, ?, ?)',
-          [eventId, event, JSON.stringify({ event, eventId, timestamp: Date.now() })]
-        );
+        try {
+          await conn.execute(
+            'INSERT INTO webhook_events (event_id, event_type, payload) VALUES (?, ?, ?)',
+            [eventId, event, JSON.stringify({ event, eventId, timestamp: Date.now() })]
+          );
+        } catch (dupErr) {
+          if (dupErr.code === 'ER_DUP_ENTRY') {
+            console.log(`ℹ️ [Razorpay Webhook]: Concurrent event ${eventId} already recorded.`);
+            return;
+          }
+          throw dupErr;
+        }
       }
 
       if (event === 'payment.captured') {
         const paymentEntity = payload.payment?.entity;
         const rzpOrderId = paymentEntity?.order_id;
         const rzpPaymentId = paymentEntity?.id;
-        const method = paymentEntity?.method ? paymentEntity.method.toUpperCase() : 'RAZORPAY';
+        const entityAmount = paymentEntity?.amount;
+        const entityCurrency = paymentEntity?.currency;
+        const method = paymentEntity?.method ? String(paymentEntity.method).toUpperCase() : 'RAZORPAY';
 
         if (rzpOrderId) {
+          // Lock in consistent order: order_drafts first, then orders
+          const [draftRows] = await conn.execute(
+            `SELECT * FROM order_drafts WHERE razorpay_order_id = ? FOR UPDATE`,
+            [rzpOrderId]
+          );
+
           const [orders] = await conn.execute(
             `SELECT id, order_number, payment_status
              FROM orders WHERE razorpay_order_id = ? FOR UPDATE`,
@@ -372,104 +489,118 @@ exports.handleWebhook = async (req, res, next) => {
               );
               console.log(`✅ [Razorpay Webhook]: Existing Order #${order.order_number} confirmed & marked as PAID via payment.captured`);
             }
-          } else {
-            // Order was not yet created via client verify — create from draft
-            const [draftRows] = await conn.execute(
-              `SELECT * FROM order_drafts WHERE razorpay_order_id = ? FOR UPDATE`,
-              [rzpOrderId]
+          } else if (draftRows.length > 0) {
+            const draft = draftRows[0];
+
+            // If draft is already completed, do not duplicate order
+            if (draft.status === 'COMPLETED') {
+              console.log(`ℹ️ [Razorpay Webhook]: Draft ${rzpOrderId} is already COMPLETED. Skipping duplicate creation.`);
+              return;
+            }
+
+            // Anti-tampering check: Validate webhook payment amount against server-calculated draft amount
+            const expectedPaise = Math.round(Number(draft.payable_amount) * 100);
+            if (entityAmount && Number(entityAmount) !== expectedPaise) {
+              console.error(`❌ [Razorpay Webhook]: Amount mismatch for order ${rzpOrderId}! Expected: ${expectedPaise} paise, Received: ${entityAmount} paise. Rejecting.`);
+              return;
+            }
+
+            // Validate currency
+            if (entityCurrency && String(entityCurrency).toUpperCase() !== 'INR') {
+              console.error(`❌ [Razorpay Webhook]: Currency mismatch for order ${rzpOrderId}! Expected INR, Received: ${entityCurrency}. Rejecting.`);
+              return;
+            }
+
+            const delivery = typeof draft.delivery_details === 'string' ? JSON.parse(draft.delivery_details) : draft.delivery_details;
+            const items = typeof draft.items_data === 'string' ? JSON.parse(draft.items_data) : draft.items_data;
+
+            const [orderInsert] = await conn.execute(
+              `INSERT INTO orders (
+                order_number, user_id, full_name, primary_mobile, secondary_mobile,
+                address, state, district, city, village, pincode,
+                latitude, longitude, maps_url,
+                subtotal, shipping_amount, total_amount, payment_mode, advance_amount, remaining_cod_amount,
+                payment_status, razorpay_order_id, is_shipped, is_delivered
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PAID', ?, 0, 0)`,
+              [
+                draft.order_number,
+                draft.user_id,
+                delivery.full_name,
+                delivery.primary_mobile,
+                delivery.secondary_mobile || null,
+                delivery.address,
+                delivery.state,
+                delivery.district,
+                delivery.city || null,
+                delivery.village || null,
+                delivery.pincode,
+                delivery.validLat || null,
+                delivery.validLng || null,
+                delivery.mapsUrl || null,
+                draft.subtotal,
+                draft.shipping_amount,
+                draft.total_amount,
+                draft.payment_mode,
+                draft.advance_amount,
+                draft.remaining_cod_amount,
+                rzpOrderId
+              ]
             );
 
-            if (draftRows.length > 0) {
-              const draft = draftRows[0];
-              const delivery = typeof draft.delivery_details === 'string' ? JSON.parse(draft.delivery_details) : draft.delivery_details;
-              const items = typeof draft.items_data === 'string' ? JSON.parse(draft.items_data) : draft.items_data;
+            const newOrderId = orderInsert.insertId;
 
-              const [orderInsert] = await conn.execute(
-                `INSERT INTO orders (
-                  order_number, user_id, full_name, primary_mobile, secondary_mobile,
-                  address, state, district, city, village, pincode,
-                  latitude, longitude, maps_url,
-                  subtotal, shipping_amount, total_amount, payment_mode, advance_amount, remaining_cod_amount,
-                  payment_status, razorpay_order_id, is_shipped, is_delivered
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PAID', ?, 0, 0)`,
-                [
-                  draft.order_number,
-                  draft.user_id,
-                  delivery.full_name,
-                  delivery.primary_mobile,
-                  delivery.secondary_mobile || null,
-                  delivery.address,
-                  delivery.state,
-                  delivery.district,
-                  delivery.city || null,
-                  delivery.village || null,
-                  delivery.pincode,
-                  delivery.validLat || null,
-                  delivery.validLng || null,
-                  delivery.mapsUrl || null,
-                  draft.subtotal,
-                  draft.shipping_amount,
-                  draft.total_amount,
-                  draft.payment_mode,
-                  draft.advance_amount,
-                  draft.remaining_cod_amount,
-                  rzpOrderId
-                ]
-              );
-
-              const newOrderId = orderInsert.insertId;
-
-              for (const it of items) {
-                await conn.execute(
-                  `INSERT INTO order_items (
-                    order_id, product_id, product_name, product_sku, product_image,
-                    unit_price, quantity, subtotal_price
-                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                  [
-                    newOrderId,
-                    it.productId || it.product_id,
-                    it.name || it.product_name,
-                    it.sku || it.product_sku,
-                    it.image || it.product_image || '',
-                    it.unitPrice || it.unit_price,
-                    it.quantity,
-                    it.subtotalPrice || it.subtotal_price
-                  ]
-                );
-              }
-
+            for (const it of items) {
               await conn.execute(
-                `INSERT INTO payments (
-                  order_id, user_id, amount, payment_mode, payment_type, remaining_cod_amount,
-                  payment_method, transaction_id, razorpay_order_id, razorpay_payment_id,
-                  payment_status, gateway
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PAID', 'RAZORPAY')`,
+                `INSERT INTO order_items (
+                  order_id, product_id, product_name, product_sku, product_image,
+                  unit_price, quantity, subtotal_price
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
                   newOrderId,
-                  draft.user_id,
-                  draft.payable_amount,
-                  draft.payment_mode,
-                  draft.payment_mode === 'COD' ? 'COD_ADVANCE' : 'FULL',
-                  draft.remaining_cod_amount,
-                  method,
-                  rzpPaymentId,
-                  rzpOrderId,
-                  rzpPaymentId
+                  it.productId || it.product_id,
+                  it.name || it.product_name,
+                  it.sku || it.product_sku,
+                  it.image || it.product_image || '',
+                  it.unitPrice || it.unit_price,
+                  it.quantity,
+                  it.subtotalPrice || it.subtotal_price
                 ]
               );
-
-              await conn.execute(
-                `UPDATE order_drafts SET status = 'COMPLETED' WHERE id = ?`,
-                [draft.id]
-              );
-
-              console.log(`✅ [Razorpay Webhook]: Order #${draft.order_number} created from draft and marked PAID via webhook payment.captured`);
             }
+
+            await conn.execute(
+              `INSERT INTO payments (
+                order_id, user_id, amount, payment_mode, payment_type, remaining_cod_amount,
+                payment_method, transaction_id, razorpay_order_id, razorpay_payment_id,
+                payment_status, gateway
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PAID', 'RAZORPAY')`,
+              [
+                newOrderId,
+                draft.user_id,
+                draft.payable_amount,
+                draft.payment_mode,
+                draft.payment_mode === 'COD' ? 'COD_ADVANCE' : 'FULL',
+                draft.remaining_cod_amount,
+                method,
+                rzpPaymentId,
+                rzpOrderId,
+                rzpPaymentId
+              ]
+            );
+
+            await conn.execute(
+              `UPDATE order_drafts SET status = 'COMPLETED' WHERE id = ?`,
+              [draft.id]
+            );
+
+            console.log(`✅ [Razorpay Webhook]: Order #${draft.order_number} created from draft and marked PAID via webhook payment.captured`);
           }
         }
       } else if (event === 'payment.failed') {
         const paymentEntity = payload.payment?.entity;
         const rzpOrderId = paymentEntity?.order_id;
+        const rzpPaymentId = paymentEntity?.id;
+        const failReason = paymentEntity?.error_description || paymentEntity?.error_code || 'Payment failed';
 
         if (rzpOrderId) {
           await conn.execute(
@@ -478,7 +609,17 @@ exports.handleWebhook = async (req, res, next) => {
              WHERE razorpay_order_id = ? AND status = 'INITIATED'`,
             [rzpOrderId]
           );
-          console.log(`ℹ️ [Razorpay Webhook]: Draft for ${rzpOrderId} marked as FAILED`);
+
+          // If payment record existed for this order, update its status
+          await conn.execute(
+            `UPDATE payments
+             SET payment_status = 'FAILED',
+                 error_reason = ?
+             WHERE razorpay_order_id = ? AND payment_status != 'PAID'`,
+            [failReason, rzpOrderId]
+          );
+
+          console.log(`ℹ️ [Razorpay Webhook]: Draft for ${rzpOrderId} marked as FAILED (${failReason})`);
         }
       } else if (event === 'refund.created' || event === 'refund.processed') {
         const refundEntity = payload.refund?.entity;
@@ -499,6 +640,17 @@ exports.handleWebhook = async (req, res, next) => {
              WHERE razorpay_payment_id = ?`,
             [refundId, refundAmount, refundStatus, refundStatus, rzpPaymentId]
           );
+
+          // When refund is processed, synchronize the order payment_status to REFUNDED as well
+          if (refundStatus === 'processed') {
+            await conn.execute(
+              `UPDATE orders o
+               JOIN payments p ON p.order_id = o.id
+               SET o.payment_status = 'REFUNDED'
+               WHERE p.razorpay_payment_id = ?`,
+              [rzpPaymentId]
+            );
+          }
 
           console.log(`↩️ [Razorpay Webhook]: Refund ${refundId} recorded for payment ${rzpPaymentId} (${refundStatus})`);
         }

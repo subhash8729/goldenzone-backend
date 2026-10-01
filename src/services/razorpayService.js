@@ -19,13 +19,38 @@ function getRazorpayInstance() {
 }
 
 /**
+ * Helper to run a promise with a timeout
+ */
+function withTimeout(promise, ms, operationName = 'Razorpay Operation') {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      const timer = setTimeout(() => {
+        const err = new Error(`${operationName} timed out after ${ms}ms`);
+        err.statusCode = 504;
+        reject(err);
+      }, ms);
+      if (typeof timer.unref === 'function') timer.unref();
+    })
+  ]);
+}
+
+/**
  * Create a new Razorpay Order
  * @param {Object} params - { amount (in INR), receipt, notes }
  * @returns {Promise<Object>} Razorpay Order details
  */
 async function createRazorpayOrder({ amount, receipt, notes = {} }) {
   const rzp = getRazorpayInstance();
-  const amountInPaise = Math.round(parseFloat(amount) * 100);
+  const parsedAmount = parseFloat(amount);
+
+  if (isNaN(parsedAmount) || parsedAmount < 1.0) {
+    const err = new Error('Order amount must be at least ₹1.00');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const amountInPaise = Math.round(parsedAmount * 100);
 
   if (!rzp) {
     throw new Error('Razorpay credentials (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET) are not configured on server.');
@@ -34,18 +59,16 @@ async function createRazorpayOrder({ amount, receipt, notes = {} }) {
   const options = {
     amount: amountInPaise, // amount in smallest currency unit (paise)
     currency: 'INR',
-    receipt: String(receipt).slice(0, 40),
-    notes
+    receipt: String(receipt || '').slice(0, 40),
+    notes: typeof notes === 'object' && notes !== null ? notes : {}
   };
 
   try {
-    return await rzp.orders.create(options);
+    return await withTimeout(rzp.orders.create(options), 10000, 'Razorpay order creation');
   } catch (error) {
-    // The SDK can throw malformed network errors (without response/status). Do not expose
-    // those internals or leave callers with an unusable checkout state.
     console.error('[Razorpay Service]: Unable to create order:', error?.message || 'unknown gateway error');
     const gatewayError = new Error('Payment gateway is temporarily unavailable. Please try again shortly.');
-    gatewayError.statusCode = 503;
+    gatewayError.statusCode = error.statusCode === 400 ? 400 : 503;
     throw gatewayError;
   }
 }
@@ -65,27 +88,35 @@ function verifyPaymentSignature(params) {
     secret
   } = params || {};
 
-  const ordId = razorpay_order_id || orderId;
-  const payId = razorpay_payment_id || paymentId;
-  const sig = razorpay_signature || signature;
+  const ordId = (razorpay_order_id || orderId);
+  const payId = (razorpay_payment_id || paymentId);
+  const sig = (razorpay_signature || signature);
   const sec = secret || config.razorpayKeySecret;
 
   if (!sec) {
     throw new Error('RAZORPAY_KEY_SECRET is missing on the server.');
   }
 
-  if (!ordId || !payId || !sig) {
+  if (typeof ordId !== 'string' || typeof payId !== 'string' || typeof sig !== 'string') {
     return false;
   }
 
-  const body = ordId + '|' + payId;
+  const cleanOrdId = ordId.trim();
+  const cleanPayId = payId.trim();
+  const cleanSig = sig.trim();
+
+  if (!cleanOrdId || !cleanPayId || !cleanSig) {
+    return false;
+  }
+
+  const body = `${cleanOrdId}|${cleanPayId}`;
   const expectedSignature = crypto
     .createHmac('sha256', sec)
-    .update(body.toString())
+    .update(body)
     .digest('hex');
 
   const expectedBuffer = Buffer.from(expectedSignature, 'utf8');
-  const actualBuffer = Buffer.from(sig, 'utf8');
+  const actualBuffer = Buffer.from(cleanSig, 'utf8');
 
   if (expectedBuffer.length !== actualBuffer.length) {
     return false;
@@ -107,7 +138,12 @@ function verifyWebhookSignature(rawBody, signature, secretOverride) {
     return false;
   }
 
-  if (!rawBody || !signature) {
+  if (!rawBody || typeof signature !== 'string') {
+    return false;
+  }
+
+  const cleanSignature = signature.trim();
+  if (!cleanSignature) {
     return false;
   }
 
@@ -117,7 +153,7 @@ function verifyWebhookSignature(rawBody, signature, secretOverride) {
     .digest('hex');
 
   const expectedBuffer = Buffer.from(expectedSignature, 'utf8');
-  const actualBuffer = Buffer.from(signature, 'utf8');
+  const actualBuffer = Buffer.from(cleanSignature, 'utf8');
 
   if (expectedBuffer.length !== actualBuffer.length) {
     return false;
@@ -127,14 +163,14 @@ function verifyWebhookSignature(rawBody, signature, secretOverride) {
 }
 
 /**
- * Fetch Payment details from Razorpay
+ * Fetch Payment details from Razorpay with timeout
  */
-async function fetchPaymentDetails(paymentId) {
+async function fetchPaymentDetails(paymentId, timeoutMs = 6000) {
   const rzp = getRazorpayInstance();
-  if (!rzp) return null;
+  if (!rzp || !paymentId || typeof paymentId !== 'string') return null;
 
   try {
-    return await rzp.payments.fetch(paymentId);
+    return await withTimeout(rzp.payments.fetch(paymentId.trim()), timeoutMs, `Fetch payment ${paymentId}`);
   } catch (err) {
     console.error(`[Razorpay Service]: Error fetching payment ${paymentId}:`, err.message);
     return null;

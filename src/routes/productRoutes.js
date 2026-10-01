@@ -10,7 +10,14 @@ router.put('/:id', verifyAdminAuth, productController.updateProduct);
 router.delete('/:id', verifyAdminAuth, productController.deleteProduct);
 router.patch('/:id/toggle', verifyAdminAuth, productController.toggleProductFlag);
 
-// Public endpoints. Dynamic routes must be last so they do not shadow /admin/all.
+// Dedicated Product Image Management endpoints
+router.get('/:id/images', verifyAdminAuth, productController.getProductImages);
+router.post('/:id/images', verifyAdminAuth, productController.addProductImage);
+router.delete('/:productId/images/:imageId', verifyAdminAuth, productController.deleteProductImage);
+router.patch('/:productId/images/:imageId/primary', verifyAdminAuth, productController.setPrimaryProductImage);
+router.put('/:productId/images/reorder', verifyAdminAuth, productController.reorderProductImages);
+
+// Public endpoints. Dynamic routes must be last so they do not shadow /admin/all or sub-resources.
 router.get('/', productController.getProducts);
 router.get('/:identifier', productController.getProductDetail);
 

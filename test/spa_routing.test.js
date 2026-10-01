@@ -204,22 +204,29 @@ async function runSpaRoutingTests() {
     // ----------------------------------------------------------
     console.log('\n--- 5. Static Assets & File Extension Handling ---');
     // Storefront asset
+    const fs = require('fs');
+    const path = require('path');
+    const clientAssets = fs.existsSync(path.resolve(__dirname, '../../client/dist/assets'))
+      ? fs.readdirSync(path.resolve(__dirname, '../../client/dist/assets'))
+      : [];
+    const clientJs = clientAssets.find(f => f.startsWith('index-') && f.endsWith('.js')) || 'index-DY5G2fWJ.js';
+
     const clientAssetRes = await makeRequest({
       hostname: '127.0.0.1',
       port,
-      path: '/assets/index-DlX6imMK.js',
+      path: `/assets/${clientJs}`,
       method: 'GET'
     });
     test(
-      'GET /assets/index-DlX6imMK.js -> 200 JavaScript',
+      `GET /assets/${clientJs} -> 200 JavaScript`,
       clientAssetRes.status === 200 && clientAssetRes.headers['content-type']?.includes('javascript')
     );
 
     // Admin asset at root fallback
-    const fs = require('fs');
-    const path = require('path');
-    const adminAssets = fs.readdirSync(path.resolve(__dirname, '../../admin/dist/assets'));
-    const adminJs = adminAssets.find(f => f.startsWith('index-') && f.endsWith('.js')) || 'index-ChQlZE6G.js';
+    const adminAssets = fs.existsSync(path.resolve(__dirname, '../../admin/dist/assets'))
+      ? fs.readdirSync(path.resolve(__dirname, '../../admin/dist/assets'))
+      : [];
+    const adminJs = adminAssets.find(f => f.startsWith('index-') && f.endsWith('.js')) || 'index-DUQkhtCl.js';
 
     const adminAssetRes = await makeRequest({
       hostname: '127.0.0.1',

@@ -320,17 +320,49 @@ exports.getAdminProducts = async (req, res, next) => {
       [...params, pageSize, offset]
     );
 
-    const formatted = products.map((p) => ({
-      ...p,
-      regular_price: parseFloat(p.regular_price),
-      discounted_price: parseFloat(p.discounted_price),
-      discount_percentage: calculateDiscount(p.regular_price, p.discounted_price),
-      is_out_of_stock: Boolean(p.is_out_of_stock),
-      is_recommended: Boolean(p.is_recommended),
-      is_bestseller: Boolean(p.is_bestseller),
-      is_new_arrival: Boolean(p.is_new_arrival),
-      is_active: Boolean(p.is_active)
-    }));
+    // Fetch all images for all retrieved products to give admin full multi-image access
+    const productIds = products.map((p) => p.id);
+    let imagesByProductId = {};
+    if (productIds.length > 0) {
+      const placeholders = productIds.map(() => '?').join(',');
+      const allImages = await db.query(
+        `SELECT id, product_id, image_url, image_order 
+         FROM product_images 
+         WHERE product_id IN (${placeholders}) 
+         ORDER BY image_order ASC, id ASC`,
+        productIds
+      );
+      for (const img of allImages) {
+        if (!imagesByProductId[img.product_id]) {
+          imagesByProductId[img.product_id] = [];
+        }
+        imagesByProductId[img.product_id].push({
+          id: img.id,
+          product_id: img.product_id,
+          image_url: img.image_url,
+          image_order: img.image_order,
+          is_primary: imagesByProductId[img.product_id].length === 0
+        });
+      }
+    }
+
+    const formatted = products.map((p) => {
+      const prodImages = imagesByProductId[p.id] || [];
+      return {
+        ...p,
+        regular_price: parseFloat(p.regular_price),
+        discounted_price: parseFloat(p.discounted_price),
+        discount_percentage: calculateDiscount(p.regular_price, p.discounted_price),
+        is_out_of_stock: Boolean(p.is_out_of_stock),
+        is_recommended: Boolean(p.is_recommended),
+        is_bestseller: Boolean(p.is_bestseller),
+        is_new_arrival: Boolean(p.is_new_arrival),
+        is_active: Boolean(p.is_active),
+        images: prodImages,
+        image_count: prodImages.length,
+        primary_image: prodImages[0]?.image_url || p.primary_image || null
+      };
+    });
 
     return res.status(200).json({
       success: true,
@@ -640,6 +672,237 @@ exports.toggleProductFlag = async (req, res, next) => {
       message: `Product ${field} updated successfully`,
       field,
       value: Boolean(boolVal)
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// 6. Admin: Get all images for a specific product
+exports.getProductImages = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const existing = await db.query('SELECT id, name, sku FROM products WHERE id = ?', [id]);
+    if (existing.length === 0) {
+      return res.status(404).json({ success: false, message: 'Product not found' });
+    }
+
+    const images = await db.query(
+      `SELECT id, product_id, image_url, image_order, created_at
+       FROM product_images
+       WHERE product_id = ?
+       ORDER BY image_order ASC, id ASC`,
+      [id]
+    );
+
+    const formattedImages = images.map((img, idx) => ({
+      ...img,
+      is_primary: idx === 0
+    }));
+
+    return res.status(200).json({
+      success: true,
+      product: existing[0],
+      count: formattedImages.length,
+      images: formattedImages
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// 7. Admin: Add an image to a product
+exports.addProductImage = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { image_url } = req.body;
+
+    if (!image_url || typeof image_url !== 'string' || !image_url.trim()) {
+      return res.status(400).json({ success: false, message: 'Valid image URL is required' });
+    }
+
+    const trimmedUrl = image_url.trim();
+    if (trimmedUrl.length > 500) {
+      return res.status(400).json({ success: false, message: 'Image URL is too long (maximum 500 characters)' });
+    }
+
+    if (!/^https?:\/\//i.test(trimmedUrl) && !trimmedUrl.startsWith('/')) {
+      return res.status(400).json({ success: false, message: 'Image URL must start with http:// or https:// or /' });
+    }
+
+    const existing = await db.query('SELECT id, name FROM products WHERE id = ?', [id]);
+    if (existing.length === 0) {
+      return res.status(404).json({ success: false, message: 'Product not found' });
+    }
+
+    // Check maximum images limit (10 images per product)
+    const countRows = await db.query('SELECT COUNT(*) as total FROM product_images WHERE product_id = ?', [id]);
+    if (countRows[0].total >= 10) {
+      return res.status(400).json({ success: false, message: 'Product already has the maximum of 10 images' });
+    }
+
+    // Determine next order
+    const maxOrderRows = await db.query(
+      'SELECT COALESCE(MAX(image_order), 0) as max_order FROM product_images WHERE product_id = ?',
+      [id]
+    );
+    const nextOrder = (maxOrderRows[0]?.max_order || 0) + 1;
+
+    const result = await db.query(
+      'INSERT INTO product_images (product_id, image_url, image_order) VALUES (?, ?, ?)',
+      [id, trimmedUrl, nextOrder]
+    );
+
+    await logAdminAction(req.admin.id, 'PRODUCT_IMAGE_ADDED', 'PRODUCT', id, {
+      product_name: existing[0].name,
+      image_id: result.insertId,
+      image_url: trimmedUrl
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Product image added successfully',
+      image: {
+        id: result.insertId,
+        product_id: parseInt(id, 10),
+        image_url: trimmedUrl,
+        image_order: nextOrder,
+        is_primary: countRows[0].total === 0
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// 8. Admin: Delete an individual product image without deleting the product
+exports.deleteProductImage = async (req, res, next) => {
+  try {
+    const { productId, imageId } = req.params;
+
+    const existing = await db.query(
+      'SELECT id, product_id, image_url FROM product_images WHERE id = ? AND product_id = ?',
+      [imageId, productId]
+    );
+
+    if (existing.length === 0) {
+      return res.status(404).json({ success: false, message: 'Product image not found' });
+    }
+
+    await db.withTransaction(async (conn) => {
+      // 1. Delete ONLY the target image row from product_images
+      await conn.execute('DELETE FROM product_images WHERE id = ? AND product_id = ?', [imageId, productId]);
+
+      // 2. Re-normalize remaining images order to 1, 2, 3...
+      const [remaining] = await conn.execute(
+        'SELECT id FROM product_images WHERE product_id = ? ORDER BY image_order ASC, id ASC',
+        [productId]
+      );
+      for (let i = 0; i < remaining.length; i++) {
+        await conn.execute('UPDATE product_images SET image_order = ? WHERE id = ?', [i + 1, remaining[i].id]);
+      }
+    });
+
+    await logAdminAction(req.admin.id, 'PRODUCT_IMAGE_DELETED', 'PRODUCT', productId, {
+      image_id: imageId,
+      image_url: existing[0].image_url
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Product image deleted successfully'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// 9. Admin: Set an image as the main / primary image
+exports.setPrimaryProductImage = async (req, res, next) => {
+  try {
+    const { productId, imageId } = req.params;
+
+    const existing = await db.query(
+      'SELECT id, product_id, image_url FROM product_images WHERE id = ? AND product_id = ?',
+      [imageId, productId]
+    );
+
+    if (existing.length === 0) {
+      return res.status(404).json({ success: false, message: 'Product image not found' });
+    }
+
+    await db.withTransaction(async (conn) => {
+      // Fetch all images for this product currently ordered
+      const [allImgs] = await conn.execute(
+        'SELECT id FROM product_images WHERE product_id = ? ORDER BY image_order ASC, id ASC',
+        [productId]
+      );
+
+      // Target image becomes first (order 1), others follow in relative sequence
+      const targetId = parseInt(imageId, 10);
+      const reorderedIds = [
+        targetId,
+        ...allImgs.map((img) => img.id).filter((imgId) => imgId !== targetId)
+      ];
+
+      for (let i = 0; i < reorderedIds.length; i++) {
+        await conn.execute('UPDATE product_images SET image_order = ? WHERE id = ?', [i + 1, reorderedIds[i]]);
+      }
+    });
+
+    await logAdminAction(req.admin.id, 'PRODUCT_PRIMARY_IMAGE_UPDATED', 'PRODUCT', productId, {
+      primary_image_id: imageId,
+      image_url: existing[0].image_url
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Primary image updated successfully'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// 10. Admin: Reorder multiple product images
+exports.reorderProductImages = async (req, res, next) => {
+  try {
+    const { productId } = req.params;
+    const { imageIds } = req.body;
+
+    if (!Array.isArray(imageIds) || imageIds.length === 0) {
+      return res.status(400).json({ success: false, message: 'imageIds array is required' });
+    }
+
+    const currentImgs = await db.query(
+      'SELECT id FROM product_images WHERE product_id = ?',
+      [productId]
+    );
+
+    const validIdSet = new Set(currentImgs.map((img) => img.id));
+    for (const id of imageIds) {
+      if (!validIdSet.has(parseInt(id, 10))) {
+        return res.status(400).json({ success: false, message: `Image ID ${id} does not belong to this product` });
+      }
+    }
+
+    await db.withTransaction(async (conn) => {
+      for (let i = 0; i < imageIds.length; i++) {
+        await conn.execute('UPDATE product_images SET image_order = ? WHERE id = ? AND product_id = ?', [
+          i + 1,
+          imageIds[i],
+          productId
+        ]);
+      }
+    });
+
+    await logAdminAction(req.admin.id, 'PRODUCT_IMAGES_REORDERED', 'PRODUCT', productId, {
+      new_order: imageIds
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Images reordered successfully'
     });
   } catch (error) {
     next(error);
