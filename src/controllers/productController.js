@@ -54,7 +54,7 @@ exports.getProducts = async (req, res, next) => {
     const params = [];
     const countParams = [];
 
-    let whereSql = `WHERE p.deleted_at IS NULL AND p.is_active = 1`;
+    let whereSql = `WHERE p.is_active = 1`;
 
     if (category) {
       whereSql += ` AND (c.slug = ? OR c.id = ?)`;
@@ -166,7 +166,7 @@ exports.getProductDetail = async (req, res, next) => {
       `SELECT p.*, c.name as category_name, c.slug as category_slug
        FROM products p
        LEFT JOIN categories c ON p.category_id = c.id
-       WHERE (p.slug = ? OR p.id = ?) AND p.deleted_at IS NULL AND p.is_active = 1
+       WHERE (p.slug = ? OR p.id = ?) AND p.is_active = 1
        LIMIT 1`,
       [identifier, identifier]
     );
@@ -204,7 +204,7 @@ exports.getProductDetail = async (req, res, next) => {
                ORDER BY pi.image_order ASC 
                LIMIT 1) as primary_image
        FROM products p
-       WHERE p.category_id = ? AND p.id != ? AND p.deleted_at IS NULL AND p.is_active = 1
+       WHERE p.category_id = ? AND p.id != ? AND p.is_active = 1
        LIMIT 8`,
       [product.category_id, product.id]
     );
@@ -257,7 +257,7 @@ exports.getAdminProducts = async (req, res, next) => {
     const params = [];
     const countParams = [];
 
-    let whereSql = `WHERE p.deleted_at IS NULL`;
+    let whereSql = `WHERE 1=1`;
 
     if (category_id) {
       whereSql += ` AND p.category_id = ?`;
@@ -483,7 +483,7 @@ exports.updateProduct = async (req, res, next) => {
       images
     } = req.body;
 
-    const existing = await db.query('SELECT * FROM products WHERE id = ? AND deleted_at IS NULL', [id]);
+    const existing = await db.query('SELECT * FROM products WHERE id = ?', [id]);
     if (existing.length === 0) {
       return res.status(404).json({ success: false, message: 'Product not found' });
     }
@@ -578,22 +578,36 @@ exports.updateProduct = async (req, res, next) => {
   }
 };
 
-// 4. Admin: Soft delete product
+// 4. Admin: Permanently delete product
 exports.deleteProduct = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    const existing = await db.query('SELECT name FROM products WHERE id = ? AND deleted_at IS NULL', [id]);
+    const existing = await db.query('SELECT name FROM products WHERE id = ?', [id]);
     if (existing.length === 0) {
       return res.status(404).json({ success: false, message: 'Product not found' });
     }
 
-    await db.query('UPDATE products SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?', [id]);
+    // Permanently remove product and resolve foreign key dependencies
+    await db.withTransaction(async (conn) => {
+      // 1. Unlink product from order_items so historical orders remain intact without FK conflicts
+      await conn.execute('UPDATE order_items SET product_id = NULL WHERE product_id = ?', [id]);
+
+      // 2. Remove product images
+      await conn.execute('DELETE FROM product_images WHERE product_id = ?', [id]);
+
+      // 3. Remove reviews for this product
+      await conn.execute('DELETE FROM reviews WHERE product_id = ?', [id]);
+
+      // 4. Permanently delete the product record from products table
+      await conn.execute('DELETE FROM products WHERE id = ?', [id]);
+    });
+
     await logAdminAction(req.admin.id, 'PRODUCT_DELETED', 'PRODUCT', id, { name: existing[0].name });
 
     return res.status(200).json({
       success: true,
-      message: 'Product deleted successfully (soft deleted)'
+      message: 'Product permanently deleted successfully'
     });
   } catch (error) {
     next(error);
@@ -611,7 +625,7 @@ exports.toggleProductFlag = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Invalid toggle field' });
     }
 
-    const existing = await db.query('SELECT id FROM products WHERE id = ? AND deleted_at IS NULL', [id]);
+    const existing = await db.query('SELECT id FROM products WHERE id = ?', [id]);
     if (existing.length === 0) {
       return res.status(404).json({ success: false, message: 'Product not found' });
     }

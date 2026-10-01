@@ -124,7 +124,7 @@ exports.createOrder = async (req, res, next) => {
                    ORDER BY pi.image_order ASC 
                    LIMIT 1) as primary_image
            FROM products p
-           WHERE p.id = ? AND p.deleted_at IS NULL FOR UPDATE`,
+           WHERE p.id = ? FOR UPDATE`,
           [prodId]
         );
 

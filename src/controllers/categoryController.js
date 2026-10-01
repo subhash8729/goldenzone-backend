@@ -17,7 +17,7 @@ exports.getCategories = async (req, res, next) => {
       `SELECT c.*,
               (SELECT COUNT(*) 
                FROM products p 
-               WHERE p.category_id = c.id AND p.deleted_at IS NULL AND p.is_active = 1) as product_count
+               WHERE p.category_id = c.id AND p.is_active = 1) as product_count
        FROM categories c
        WHERE c.is_active = 1
        ORDER BY c.display_order ASC, c.name ASC`
@@ -39,10 +39,10 @@ exports.getAllCategoriesAdmin = async (req, res, next) => {
       `SELECT c.*,
               (SELECT COUNT(*) 
                FROM products p 
-               WHERE p.category_id = c.id AND p.deleted_at IS NULL) as total_products,
+               WHERE p.category_id = c.id) as total_products,
               (SELECT COUNT(*) 
                FROM products p 
-               WHERE p.category_id = c.id AND p.deleted_at IS NULL AND p.is_active = 1) as active_products
+               WHERE p.category_id = c.id AND p.is_active = 1) as active_products
        FROM categories c
        ORDER BY c.display_order ASC, c.id ASC`
     );
@@ -149,7 +149,7 @@ exports.deleteCategory = async (req, res, next) => {
 
     // Check if any product references this category
     const activeProducts = await db.query(
-      `SELECT COUNT(*) as count FROM products WHERE category_id = ? AND deleted_at IS NULL`,
+      `SELECT COUNT(*) as count FROM products WHERE category_id = ?`,
       [id]
     );
 

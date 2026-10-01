@@ -110,10 +110,12 @@ async function runAdminBackendAudit() {
     const testOtpCode = '654321';
     const testOtpHash = otpService.hashOtp(config.adminMobile, testOtpCode);
     await db.query('DELETE FROM otp_verifications WHERE mobile_number = ?', [config.adminMobile]);
+    const nowDt = new Date();
+    const expDt = new Date(Date.now() + 15 * 60 * 1000);
     await db.query(
       `INSERT INTO otp_verifications (mobile_number, otp_hash, attempts, resend_count, last_sent_at, expires_at, is_verified)
-       VALUES (?, ?, 0, 1, NOW(), DATE_ADD(NOW(), INTERVAL 5 MINUTE), 0)`,
-      [config.adminMobile, testOtpHash]
+       VALUES (?, ?, 0, 1, ?, ?, 0)`,
+      [config.adminMobile, testOtpHash, nowDt, expDt]
     );
 
     // 1.4 Admin Login with wrong password -> OTP must NOT be consumed
@@ -197,8 +199,8 @@ async function runAdminBackendAudit() {
     await db.query('DELETE FROM otp_verifications WHERE mobile_number = ?', [lockoutMobile]);
     await db.query(
       `INSERT INTO otp_verifications (mobile_number, otp_hash, attempts, resend_count, last_sent_at, expires_at, is_verified)
-       VALUES (?, ?, 0, 1, NOW(), DATE_ADD(NOW(), INTERVAL 5 MINUTE), 0)`,
-      [lockoutMobile, lockoutHash]
+       VALUES (?, ?, 0, 1, ?, ?, 0)`,
+      [lockoutMobile, lockoutHash, nowDt, expDt]
     );
 
     // Fail 5 times
@@ -314,19 +316,30 @@ async function runAdminBackendAudit() {
     }
     console.log('  ✓ PASS: Unauthorized toggle fields strictly rejected.');
 
-    // 3.7 Soft delete product
+    // 3.7 Permanently delete product
     const deleteProdRes = await request('DELETE', `/api/products/${createdProductId}`, {
       Authorization: `Bearer ${testAdminToken}`
     });
-    console.log(`[3.7] Soft-delete product: Status=${deleteProdRes.status}`);
+    console.log(`[3.7] Permanently delete product: Status=${deleteProdRes.status}`);
     if (deleteProdRes.status !== 200) {
       throw new Error(`Expected 200 for product delete, got ${deleteProdRes.status}`);
     }
-    const [deletedProdRow] = await db.query('SELECT deleted_at FROM products WHERE id = ?', [createdProductId]);
-    if (!deletedProdRow || !deletedProdRow.deleted_at) {
-      throw new Error('Product was not marked soft-deleted in database!');
+    const deletedProdRows = await db.query('SELECT * FROM products WHERE id = ?', [createdProductId]);
+    if (deletedProdRows.length > 0) {
+      throw new Error('Product row was not permanently deleted from database!');
     }
-    console.log('  ✓ PASS: Product soft-deleted (deleted_at set, row retained in DB).');
+    const deletedProdImages = await db.query('SELECT * FROM product_images WHERE product_id = ?', [createdProductId]);
+    if (deletedProdImages.length > 0) {
+      throw new Error('Product images were not cleaned up!');
+    }
+    // Attempting to delete again should return 404 Not Found
+    const reDeleteRes = await request('DELETE', `/api/products/${createdProductId}`, {
+      Authorization: `Bearer ${testAdminToken}`
+    });
+    if (reDeleteRes.status !== 404) {
+      throw new Error(`Expected 404 when deleting already-deleted product, got ${reDeleteRes.status}`);
+    }
+    console.log('  ✓ PASS: Product permanently deleted from database (row removed, images removed, 404 on re-delete).');
 
     // ----------------------------------------------------
     // 4. ORDER CONTROLLER AUDIT

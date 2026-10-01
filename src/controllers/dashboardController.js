@@ -24,9 +24,9 @@ exports.getDashboardStats = async (req, res, next) => {
     const prodRows = await db.query(
       `SELECT 
         COUNT(*) as total_products,
-        SUM(CASE WHEN is_active = 1 AND deleted_at IS NULL THEN 1 ELSE 0 END) as active_products,
-        SUM(CASE WHEN is_out_of_stock = 1 AND deleted_at IS NULL THEN 1 ELSE 0 END) as out_of_stock_products,
-        SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END) as deleted_products
+        SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active_products,
+        SUM(CASE WHEN is_out_of_stock = 1 THEN 1 ELSE 0 END) as out_of_stock_products,
+        0 as deleted_products
        FROM products`
     );
     const prodStats = prodRows[0] || {};
